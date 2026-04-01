@@ -10,6 +10,7 @@ import time
 import sqlite3
 import hashlib
 import os
+import io
 
 # ============================
 # Database
@@ -76,8 +77,8 @@ def create_app():
     app = Flask(__name__)
 
     app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key_123")
-    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-    app.config['SESSION_COOKIE_SECURE'] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = True
 
     init_db()
 
@@ -102,30 +103,59 @@ def create_app():
     # ============================
 
     def fetch_stock_data(ticker):
+        # Try Stooq first (more reliable on cloud hosts)
+        try:
+            stooq_symbol = ticker.lower() + ".us"
+            url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
+
+            headers = {"User-Agent": "Mozilla/5.0"}
+
+            res = requests.get(url, headers=headers, timeout=10)
+
+            if res.status_code == 200 and len(res.text) > 0:
+                df = pd.read_csv(io.StringIO(res.text))
+
+                if "Close" in df.columns and "Volume" in df.columns:
+                    df = df[["Close", "Volume"]]
+                    df.dropna(inplace=True)
+
+                    if len(df) > 0:
+                        return df
+
+        except Exception as e:
+            print("Stooq fetch error:", ticker, e)
+
+        # Fallback to Yahoo
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=3mo&interval=1d"
-            res = requests.get(url, timeout=10)
 
-            if res.status_code != 200:
-                return None
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            }
 
-            data = res.json()
+            res = requests.get(url, headers=headers, timeout=10)
 
-            if not data.get("chart"):
-                return None
+            if res.status_code == 200:
+                data = res.json()
 
-            result = data["chart"]["result"][0]
-            quotes = result["indicators"]["quote"][0]
+                if data.get("chart") and data["chart"].get("result"):
+                    result = data["chart"]["result"][0]
+                    quotes = result["indicators"]["quote"][0]
 
-            df = pd.DataFrame(
-                {"Close": quotes["close"], "Volume": quotes["volume"]}
-            )
+                    df = pd.DataFrame(
+                        {"Close": quotes.get("close"), "Volume": quotes.get("volume")}
+                    )
 
-            df.dropna(inplace=True)
-            return df
+                    df.dropna(inplace=True)
 
-        except Exception:
-            return None
+                    if len(df) > 0:
+                        return df
+
+        except Exception as e:
+            print("Yahoo fetch error:", ticker, e)
+
+        return None
 
     # ============================
     # Indicators
@@ -269,6 +299,7 @@ app = create_app()
 # Tests
 # ============================
 
+
 def test_health():
     client = app.test_client()
     res = client.get("/health")
@@ -286,17 +317,23 @@ def test_scan():
     assert isinstance(data, list)
 
 
+def test_fetch():
+    data = app.scan_market()
+    assert isinstance(data, list)
+
+
 def test_login_flow():
     client = app.test_client()
-    client.post('/register', data={'username':'test1','password':'pass'})
-    res = client.get('/dashboard')
-    assert res.status_code in (200,302)
+    client.post("/register", data={"username": "test1", "password": "pass"})
+    res = client.get("/dashboard")
+    assert res.status_code in (200, 302)
 
 
 def run_tests():
     test_health()
     test_home()
     test_scan()
+    test_fetch()
     test_login_flow()
 
 
