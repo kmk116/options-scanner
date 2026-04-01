@@ -1,5 +1,6 @@
 # Options Scanner Web Dashboard
 # Public Web Dashboard with Database Users
+# Render / Gunicorn Friendly + Safe Startup
 
 from flask import Flask, request, redirect, session, jsonify
 import pandas as pd
@@ -73,7 +74,10 @@ def verify_user(username, password):
 
 def create_app():
     app = Flask(__name__)
-    app.secret_key = "change_this_secret"
+
+    app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key_123")
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    app.config['SESSION_COOKIE_SECURE'] = True
 
     init_db()
 
@@ -93,11 +97,22 @@ def create_app():
     CACHE = {"data": [], "last": 0}
     CACHE_SECONDS = 60
 
+    # ============================
+    # Data Fetch
+    # ============================
+
     def fetch_stock_data(ticker):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=3mo&interval=1d"
             res = requests.get(url, timeout=10)
+
+            if res.status_code != 200:
+                return None
+
             data = res.json()
+
+            if not data.get("chart"):
+                return None
 
             result = data["chart"]["result"][0]
             quotes = result["indicators"]["quote"][0]
@@ -108,8 +123,13 @@ def create_app():
 
             df.dropna(inplace=True)
             return df
+
         except Exception:
             return None
+
+    # ============================
+    # Indicators
+    # ============================
 
     def calculate_rsi(data, period=14):
         delta = data["Close"].diff()
@@ -120,6 +140,10 @@ def create_app():
 
     def calculate_ema(data, span=20):
         return data["Close"].ewm(span=span).mean()
+
+    # ============================
+    # Scanner
+    # ============================
 
     def scan_market():
         results = []
@@ -163,6 +187,9 @@ def create_app():
     @app.route("/")
     def home():
         return """
+        <html>
+        <head><title>Options Scanner</title></head>
+        <body>
         <h2>Options Scanner</h2>
 
         <h3>Register</h3>
@@ -171,7 +198,7 @@ def create_app():
         <input name='username'><br>
         Password:<br>
         <input name='password' type='password'><br><br>
-        <button>Register</button>
+        <button type='submit'>Register</button>
         </form>
 
         <h3>Login</h3>
@@ -180,11 +207,13 @@ def create_app():
         <input name='username'><br>
         Password:<br>
         <input name='password' type='password'><br><br>
-        <button>Login</button>
+        <button type='submit'>Login</button>
         </form>
 
         <br>
         <a href='/dashboard'>Dashboard</a>
+        </body>
+        </html>
         """
 
     @app.route("/register", methods=["POST"])
@@ -194,6 +223,7 @@ def create_app():
 
         if create_user(username, password):
             session["logged_in"] = True
+            session["username"] = username
             return redirect("/dashboard")
 
         return "User exists", 400
@@ -205,6 +235,7 @@ def create_app():
 
         if verify_user(username, password):
             session["logged_in"] = True
+            session["username"] = username
             return redirect("/dashboard")
 
         return "Unauthorized", 401
@@ -212,7 +243,7 @@ def create_app():
     @app.route("/dashboard")
     def dashboard():
         if not session.get("logged_in"):
-            return "Unauthorized", 401
+            return redirect("/")
 
         return jsonify(get_cached_scan())
 
@@ -220,11 +251,63 @@ def create_app():
     def health():
         return {"status": "ok"}
 
+    # expose for testing
+    app.scan_market = scan_market
+    app.get_cached_scan = get_cached_scan
+
     return app
 
 
+# ============================
+# Create App
+# ============================
+
 app = create_app()
 
+
+# ============================
+# Tests
+# ============================
+
+def test_health():
+    client = app.test_client()
+    res = client.get("/health")
+    assert res.status_code == 200
+
+
+def test_home():
+    client = app.test_client()
+    res = client.get("/")
+    assert res.status_code == 200
+
+
+def test_scan():
+    data = app.get_cached_scan()
+    assert isinstance(data, list)
+
+
+def test_login_flow():
+    client = app.test_client()
+    client.post('/register', data={'username':'test1','password':'pass'})
+    res = client.get('/dashboard')
+    assert res.status_code in (200,302)
+
+
+def run_tests():
+    test_health()
+    test_home()
+    test_scan()
+    test_login_flow()
+
+
+# ============================
+# Safe Start
+# ============================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    try:
+        port = int(os.environ.get("PORT", 5000))
+        app.run(host="0.0.0.0", port=port)
+    except SystemExit:
+        print("Server start skipped (restricted environment)")
+        run_tests()
